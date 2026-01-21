@@ -1,0 +1,521 @@
+require('dotenv').config(); // Carrega variáveis de ambiente do arquivo .env
+
+// ==================================================================================
+// 🚨 ÁREA DE CONFIGURAÇÃO RÁPIDA (PARA CORRIGIR ERRO DE CHAVE) 🚨
+// ==================================================================================
+// Se você não estiver conseguindo usar o arquivo .env, COLE SUA CHAVE ABAIXO:
+const CHAVE_FIXA = ""; // <--- COLE SUA CHAVE AQUI DENTRO (Começa com AIzaSy...)
+// ==================================================================================
+
+console.log("🚀 Iniciando processo do servidor...");
+
+// Define a chave final (Prioridade: Chave Fixa > Variável de Ambiente)
+const API_KEY = CHAVE_FIXA || process.env.API_KEY;
+
+// Garante que o processo tenha acesso à chave
+process.env.API_KEY = API_KEY;
+
+// Validação visual no log
+if (API_KEY && API_KEY.length > 20) {
+    console.log(`✅ API KEY CARREGADA: ${API_KEY.substring(0, 6)}...******`);
+} else {
+    // console.error("❌ AVISO CRÍTICO: NENHUMA API KEY ENCONTRADA."); // Comentado para não poluir se for opcional
+}
+
+try {
+    require.resolve('express');
+} catch (e) {
+    console.error("❌ ERRO CRÍTICO: A dependência 'express' não foi encontrada.");
+    process.exit(1);
+}
+
+const express = require('express');
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode');
+const qrcodeTerminal = require('qrcode-terminal');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const { GoogleGenAI } = require("@google/genai");
+const { transform } = require('sucrase');
+
+console.log("✅ Dependências carregadas com sucesso.");
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+const DB_FILE = path.join(__dirname, 'database.json');
+const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+// Log de requisições para depuração (FILTRADO para não poluir)
+app.use((req, res, next) => {
+    // 🛑 IGNORA O LOG DE /status PARA PARAR O LOOPING VISUAL NO CONSOLE 🛑
+    if (req.path === '/status') return next();
+
+    if (!req.path.endsWith('.js') && !req.path.endsWith('.css') && !req.path.endsWith('.ico')) {
+        console.log(`📡 REQ: ${req.method} ${req.path}`);
+    }
+    next();
+});
+
+// --- MIDDLEWARE DE COMPILAÇÃO JIT (JUST-IN-TIME) ---
+app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/') || req.path === '/qr' || req.path === '/status' || req.path === '/auth-status' || req.path === '/login' || req.path === '/recover-password' || req.path === '/send') return next();
+    
+    let filePath = path.join(__dirname, req.path);
+    if (req.path === '/') filePath = path.join(__dirname, 'index.html');
+    
+    let exists = fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+    if (!exists && !req.path.includes('.')) {
+         if (fs.existsSync(filePath + '.tsx')) { filePath += '.tsx'; exists = true; }
+         else if (fs.existsSync(filePath + '.ts')) { filePath += '.ts'; exists = true; }
+    }
+
+    if (exists && (filePath.endsWith('.tsx') || filePath.endsWith('.ts'))) {
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            const compiled = transform(content, {
+                transforms: ['typescript', 'jsx'],
+                jsxRuntime: 'classic', 
+                production: false
+            }).code;
+
+            res.setHeader('Content-Type', 'application/javascript');
+            return res.send(compiled);
+        } catch (e) {
+            console.error(`❌ Erro ao compilar ${filePath}:`, e);
+            return res.status(500).send(`console.error("Erro de compilação no servidor: ${e.message}")`);
+        }
+    }
+    next();
+});
+
+app.use(express.static(__dirname));
+
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
+const authMiddleware = (req, res, next) => {
+    const publicRoutes = ['/status', '/qr', '/auth-status', '/login', '/logout', '/recover-password', '/', '/send'];
+    if (publicRoutes.includes(req.path)) return next();
+
+    const settings = getSettings();
+    const token = req.headers['x-access-token'];
+
+    if (!settings.password) return next();
+    if (token === settings.password) return next();
+
+    console.warn(`⛔ Acesso Negado (401) em ${req.path}. Token recebido: ${token ? 'SIM (Inválido)' : 'NÃO'}`);
+    return res.status(401).json({ error: 'Unauthorized' });
+};
+
+app.use(authMiddleware);
+
+console.log(`🔧 Configurando servidor na porta ${PORT}...`);
+
+// --- IA CENTRALIZADA ---
+
+async function generateAIMessage(contact, settings, stage = 0) {
+    const agent = settings.agentName || "Seu Corretor";
+    const agency = settings.agencyName || "Imobiliária";
+    const tone = contact.messageTone || settings.messageTone || "Casual";
+
+    if (!API_KEY || API_KEY.length < 10) {
+        console.error("❌ ERRO IA: Chave de API inválida ou ausente.");
+        return generateTemplateFallback(contact, settings, stage);
+    }
+
+    console.log(`🤖 SOLICITANDO IA PARA: ${contact.name} | TIPO: ${contact.type}`);
+
+    try {
+        const ai = new GoogleGenAI({ apiKey: API_KEY });
+        const modelId = "gemini-2.5-flash"; 
+
+        // Montagem do Contexto Rico
+        let propertyContext = "";
+        if (contact.type === 'Proprietário' || contact.type === 'Construtor') {
+            if (contact.propertyType) propertyContext += `\nTIPO DO IMÓVEL: ${contact.propertyType}`;
+            if (contact.propertyAddress) propertyContext += `\nENDEREÇO/LOCAL: ${contact.propertyAddress}`;
+            if (contact.propertyValue) propertyContext += `\nVALOR PEDIDO: ${contact.propertyValue}`;
+        } else if (contact.type === 'Cliente/Comprador' && contact.hasExchange) {
+            propertyContext += `\nCLIENTE TEM PERMUTA: Sim`;
+            if (contact.exchangeDescription) propertyContext += `\nDETALHES DA PERMUTA (IMÓVEL DELE): ${contact.exchangeDescription}`;
+            if (contact.exchangeValue) propertyContext += `\nVALOR DA PERMUTA: ${contact.exchangeValue}`;
+        }
+
+        const internalNotes = contact.notes ? `\nOBSERVAÇÃO INTERNA: "${contact.notes}"` : "\nOBSERVAÇÃO INTERNA: Sem observações específicas.";
+
+        let context = "Retomada de contato.";
+        if (stage === 1) context = "Cobrança amigável (sem resposta anterior).";
+        if (stage === 99) context = "Despedida profissional.";
+
+        const prompt = `
+          Você é ${agent}, corretor da ${agency}.
+          Escreva uma mensagem de WhatsApp para ${contact.name} (${contact.type}).
+          
+          DADOS IMPORTANTES DO CLIENTE:${propertyContext}${internalNotes}
+          
+          OBJETIVO: ${context}
+          
+          REGRAS OBRIGATÓRIAS:
+          1. Use um tom ${tone}.
+          2. SE houver dados sobre o imóvel (tipo/endereço) ou permuta nos "DADOS IMPORTANTES", você DEVE mencionar sutilmente para mostrar que lembra do caso.
+          3. SE houver uma observação interna, use-a como gancho.
+          4. Se não houver dados específicos, pergunte genericamente.
+          5. Seja breve (máximo 3 linhas).
+          6. Não use hashtags.
+        `;
+
+        const response = await ai.models.generateContent({
+            model: modelId,
+            contents: [
+                {
+                    role: 'user',
+                    parts: [{ text: prompt }]
+                }
+            ],
+            config: {
+                temperature: 0.6,
+                safetySettings: [
+                    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
+                ]
+            }
+        });
+        
+        const generatedText = response.text ? response.text.trim() : null;
+        
+        if (generatedText && generatedText.length > 5) {
+            console.log("✨ IA SUCESSO:", generatedText.substring(0, 50) + "...");
+            return generatedText;
+        } else {
+            console.error("⚠️ Resposta IA vazia ou inválida.");
+            throw new Error("Resposta Vazia");
+        }
+
+    } catch (error) {
+        console.error("❌ FALHA CRÍTICA IA:", error);
+        return generateTemplateFallback(contact, settings, stage);
+    }
+}
+
+function generateTemplateFallback(contact, settings, stage = 0) {
+    console.warn("⚠️ Usando Template Padrão (Fallback Ativado).");
+    const agent = settings.agentName || "Corretor";
+    
+    if (stage === 99) return `Olá ${contact.name}, encerro nosso contato por enquanto. Se precisar, estou à disposição!`;
+    if (stage === 1) return `Olá ${contact.name}, conseguiu ver minha mensagem anterior?`;
+
+    let subject = "continuamos com o assunto";
+    if (contact.type === 'Proprietário') subject = "seu imóvel ainda está disponível";
+    if (contact.type === 'Construtor') subject = "temos novas oportunidades";
+    if (contact.type === 'Cliente/Comprador') subject = "ainda busca opções no seu perfil";
+    
+    return `Olá ${contact.name}, aqui é ${agent}. Passando para saber se ${subject}. Podemos falar?`;
+}
+
+// --- FUNÇÕES AUXILIARES ---
+
+function formatPhone(phone) {
+    let p = phone.replace(/\D/g, '');
+    if ((p.length === 10 || p.length === 11) && !p.startsWith('55')) {
+        p = '55' + p;
+    }
+    return p;
+}
+
+function isSamePhone(p1, p2) {
+    if (!p1 || !p2) return false;
+    const n1 = p1.replace(/\D/g, '');
+    const n2 = p2.replace(/\D/g, '');
+    return n1.slice(-8) === n2.slice(-8);
+}
+
+// --- BANCO DE DADOS ---
+
+function getContacts() {
+    try { if (!fs.existsSync(DB_FILE)) return []; return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { return []; }
+}
+function saveContacts(contacts) {
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(contacts, null, 2)); return true; } catch (e) { return false; }
+}
+function getSettings() {
+    try { if (!fs.existsSync(SETTINGS_FILE)) return { automationActive: false }; return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch (e) { return { automationActive: false }; }
+}
+function saveSettings(s) { try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)); } catch (e) {} }
+
+// --- WHATSAPP SETUP ---
+
+let qrCodeData = null;
+let clientStatus = 'initializing';
+let isReady = false;
+let lastQrCode = '';
+
+console.log("📲 Iniciando cliente WhatsApp...");
+const client = new Client({
+    // =========================================================================================
+    // 🆔 IDENTIFICAÇÃO DA SESSÃO
+    // Mantenha este ID igual em todos os apps que compartilham a mesma conta/número.
+    // =========================================================================================
+    authStrategy: new LocalAuth({ clientId: "imobiflow-crm-v2" }), // <--- ⚠️ VERIFIQUE SE O ID BATE COM O OUTRO APP AQUI
+    puppeteer: { 
+        headless: true, 
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--single-process', '--disable-gpu'] 
+    }
+});
+
+client.on('qr', (qr) => { 
+    if (qr === lastQrCode) return;
+    lastQrCode = qr;
+    console.log("🔹 Novo QR Code gerado.");
+    qrcodeTerminal.generate(qr, { small: true }); 
+    qrcode.toDataURL(qr, (err, url) => { if (!err) { qrCodeData = url; clientStatus = 'qr_ready'; } }); 
+});
+
+client.on('ready', () => { console.log('✅ WhatsApp Pronto!'); isReady = true; clientStatus = 'ready'; qrCodeData = null; });
+client.on('authenticated', () => { console.log('🔑 Autenticado!'); clientStatus = 'authenticated'; });
+client.on('auth_failure', () => clientStatus = 'error');
+client.on('disconnected', async () => { 
+    console.log('⚠️ Desconectado. Reconectando...'); 
+    isReady = false; clientStatus = 'disconnected'; 
+    try { await client.destroy(); } catch(e){} 
+    setTimeout(() => client.initialize(), 5000); 
+});
+
+client.on('message', async msg => {
+    if(msg.isStatus || msg.from.includes('@g.us') || msg.fromMe) return;
+    const fromNumber = msg.from.replace('@c.us', '');
+    const contacts = getContacts();
+    let updated = false;
+    for (let c of contacts) {
+        if (isSamePhone(c.phone, fromNumber)) {
+            c.hasUnreadReply = true;
+            c.lastReplyContent = msg.body;
+            c.lastReplyTimestamp = Date.now();
+            c.automationStage = 0; 
+            c.lastContactDate = new Date().toISOString(); 
+            updated = true;
+        }
+    }
+    if (updated) saveContacts(contacts);
+});
+
+// --- MOTOR DE AUTOMAÇÃO ---
+
+async function runAutomationCycle() {
+    if (!isReady) return;
+    const settings = getSettings();
+    if (!settings.automationActive) return;
+
+    const contacts = getContacts();
+    let changed = false;
+    const now = Date.now();
+
+    for (let c of contacts) {
+        if (c.autoPilotEnabled === false) continue;
+        
+        try {
+            const chatId = `${formatPhone(c.phone)}@c.us`;
+            const chat = await client.getChatById(chatId);
+            
+            if (chat && chat.timestamp) {
+                const waLastActivity = chat.timestamp * 1000;
+                const systemLastDate = new Date(c.lastContactDate || 0).getTime();
+                
+                if (waLastActivity > systemLastDate + 60000) {
+                    console.log(`🔄 SYNC: Conversa mais recente detectada no WhatsApp para ${c.name}.`);
+                    c.lastContactDate = new Date(waLastActivity).toISOString();
+                    c.automationStage = 0;
+                    
+                    try {
+                        const lastMessages = await chat.fetchMessages({limit: 1});
+                        if (lastMessages && lastMessages.length > 0) {
+                            const lastMsg = lastMessages[lastMessages.length - 1];
+                            if (!lastMsg.fromMe) {
+                                c.hasUnreadReply = true;
+                                c.lastReplyContent = lastMsg.body;
+                                c.lastReplyTimestamp = waLastActivity;
+                            } else {
+                                c.hasUnreadReply = false;
+                            }
+                        }
+                    } catch(e) {}
+
+                    changed = true;
+                    continue; 
+                }
+            }
+        } catch (err) {}
+
+        if (c.hasUnreadReply) continue;
+        
+        let shouldSend = false;
+        let stageToSend = 0;
+
+        if (c.automationStage === 0) {
+            const lastDate = new Date(c.lastContactDate || now).getTime();
+            const freqDays = c.followUpFrequencyDays || 30;
+            if ((now - lastDate) / (86400000) >= freqDays) { shouldSend = true; stageToSend = 0; }
+        } else if (c.automationStage === 1) {
+            const lastAuto = new Date(c.lastAutomatedMsgDate).getTime();
+            if ((now - lastAuto) / (86400000) >= 2) { shouldSend = true; stageToSend = 1; }
+        } else if (c.automationStage === 2) {
+             const lastAuto = new Date(c.lastAutomatedMsgDate).getTime();
+             if ((now - lastAuto) / (86400000) >= 1) { c.automationStage = 3; changed = true; }
+        }
+
+        if (shouldSend) {
+            const msg = await generateAIMessage(c, settings, stageToSend);
+            const result = await sendWpp(c.phone, msg); // Use a nova função robusta
+            if (result.success) {
+                c.automationStage = stageToSend + 1;
+                c.lastAutomatedMsgDate = new Date().toISOString();
+                c.lastContactDate = new Date().toISOString();
+                changed = true;
+            }
+        }
+    }
+    if (changed) saveContacts(contacts);
+}
+
+// FUNÇÃO DE ENVIO COM LOG DETALHADO E TRATAMENTO DE ERRO
+async function sendWpp(phone, msg) {
+    try {
+        if (!isReady) {
+            throw new Error("WhatsApp não está conectado/pronto. Escaneie o QR Code.");
+        }
+
+        const chatId = `${formatPhone(phone)}@c.us`;
+        console.log(`🔍 Buscando ID real para: ${phone} (${chatId})`);
+        
+        // Race condition: Timeout de 5s para não travar se o puppeteer congelar
+        const numberId = await Promise.race([
+            client.getNumberId(chatId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout ao validar número (5s)')), 5000))
+        ]);
+
+        if (!numberId) {
+             console.log(`⚠️ AVISO: Número não possui ID registrado no WhatsApp: ${phone}. Tentando envio forçado...`);
+        }
+
+        const finalId = numberId ? numberId._serialized : chatId;
+        console.log(`🚀 Enviando para socket ID: ${finalId}`);
+        
+        await client.sendMessage(finalId, msg);
+        console.log(`✅ Mensagem ENVIADA com sucesso!`);
+        return { success: true };
+    } catch (e) { 
+        console.error(`❌ FALHA NO ENVIO (${phone}):`, e.message);
+        return { success: false, error: e.message }; 
+    }
+}
+
+setInterval(runAutomationCycle, 600000); // 10 min
+
+// --- ENDPOINTS ---
+
+app.get('/auth-status', (req, res) => res.json({ configured: !!(getSettings().agentName && getSettings().password) }));
+app.post('/login', (req, res) => {
+    const s = getSettings();
+    if (s.password && s.password === req.body.password) return res.json({ success: true });
+    return res.status(401).json({ success: false });
+});
+
+app.post('/recover-password', (req, res) => {
+    const s = getSettings();
+    console.warn("🔐 RECUPERAÇÃO DE SENHA SOLICITADA");
+    console.warn(`🔑 A SENHA ATUAL É: "${s.password}"`);
+    res.json({ success: true, message: "Senha enviada para o log do servidor." });
+});
+
+app.get('/status', (req, res) => res.json({ status: clientStatus, isReady: isReady }));
+app.get('/qr', (req, res) => res.json({ qrCode: qrCodeData }));
+app.get('/contacts', (req, res) => res.json(getContacts()));
+app.post('/contacts', (req, res) => { saveContacts(req.body); res.json({success:true}); });
+app.get('/settings', (req, res) => res.json(getSettings()));
+app.post('/settings', (req, res) => { saveSettings(req.body); res.json({success:true}); });
+app.get('/trigger-automation', (req, res) => { runAutomationCycle(); res.json({success:true}); });
+
+app.post('/generate-message', async (req, res) => {
+    const msg = await generateAIMessage(req.body.contact, req.body.settings);
+    res.json({ message: msg });
+});
+
+app.post('/toggle-automation', (req, res) => {
+    const s = getSettings(); s.automationActive = req.body.active; saveSettings(s);
+    if(s.automationActive) setTimeout(runAutomationCycle, 1000);
+    res.json({success:true});
+});
+
+// Endpoint de Envio Atualizado
+app.post('/send', async (req, res) => { 
+    console.log(`📨 REQUEST /send recebido para: ${req.body.phone}`);
+    
+    // Pequeno delay aleatório para parecer mais humano
+    await new Promise(r => setTimeout(r, Math.random() * 1000 + 500));
+
+    const result = await sendWpp(req.body.phone, req.body.message); 
+    
+    if (result.success) {
+        res.json({success:true}); 
+    } else {
+        res.status(500).json({success:false, error: result.error || 'Erro desconhecido no servidor'});
+    }
+});
+
+app.post('/logout', async (req, res) => {
+    try { await client.logout(); } catch (e) {}
+    client.initialize();
+    isReady = false; clientStatus = 'initializing';
+    res.json({success:true});
+});
+
+app.get('/chat/:phone', async (req, res) => {
+    if (!isReady) return res.json([]);
+    try {
+        const chat = await client.getChatById(`${formatPhone(req.params.phone)}@c.us`);
+        const msgs = await chat.fetchMessages({ limit: 50 });
+        res.json(msgs.map(m => ({ id: m.id.id, fromMe: m.fromMe, body: m.body, timestamp: m.timestamp })));
+    } catch { res.json([]); }
+});
+
+app.get('/whatsapp-contacts', async (req, res) => {
+    if (!isReady) return res.status(503).json({ error: 'Offline' });
+    try {
+        const chats = await client.getChats();
+        const unique = [];
+        const seen = new Set();
+        
+        console.log(`📥 Importando ${chats.length} chats...`);
+        let addressBook = new Map();
+        try {
+            const savedContacts = await client.getContacts();
+            savedContacts.forEach(contact => {
+               if (contact.id.user && (contact.name || contact.pushname)) {
+                   addressBook.set(contact.id.user, contact.name || contact.pushname);
+               }
+            });
+        } catch (err) {}
+
+        const recentChats = chats.slice(0, 500);
+        for(const c of recentChats) {
+            if(!c.isGroup && !seen.has(c.id.user)) {
+                seen.add(c.id.user);
+                const savedName = addressBook.get(c.id.user);
+                let displayName = savedName || c.name || c.id.user;
+                if (!displayName || displayName === c.id.user) {
+                    displayName = `+${c.id.user}`;
+                }
+                unique.push({ name: displayName, phone: c.id.user, timestamp: c.timestamp });
+            }
+        }
+        res.json(unique);
+    } catch (e) { 
+        res.status(500).json({error: e.message}); 
+    }
+});
+
+client.initialize().catch(err => console.error("❌ Erro fatal:", err));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Servidor rodando na porta ${PORT}`));
